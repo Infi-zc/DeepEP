@@ -96,6 +96,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # 填的是这个 token 是发到这个 rank 上的 idx 信息
     # T [num_ranks, num_tokens] -> [num_tokens, num_ranks] 看成是，这个 token 是否在某个 rank 上
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
+    is_token_in_rank = token_idx_in_rank >= 0
     # 改成一个指示矩阵，[num_tokens, num_ranks]，在的是 1 不在的是 0
     # 指示全局来看，每个 ep_rank 上，有多少个 token 过来
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
