@@ -11,6 +11,7 @@ from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_un
 import test_low_latency
 
 
+# rank 的语义是 ep_rank 的语义
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup):
     # Settings
     num_tokens, hidden, num_topk_groups, num_topk, num_experts = 4096, 7168, min(num_nodes, 4), 8, (256 // num_ranks) * num_ranks
@@ -19,57 +20,91 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
         print(f'[config] num_tokens={num_tokens}, hidden={hidden}, num_topk_groups={num_topk_groups}, num_topk={num_topk}', flush=True)
 
     # Random data
+    # 构造得分，每个卡上的得分，rank 上的得分是 rank
     x = torch.ones((num_tokens, hidden), dtype=torch.bfloat16, device='cuda') * rank
+    # hidden
     x_pure_rand = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
     x_e4m3 = per_token_cast_to_fp8(x)
+    # score
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
+    # 按组的得分
     group_scores = scores.view(num_tokens, num_nodes, -1).amax(dim=-1)
+    # 选的组
     group_idx = torch.topk(group_scores, k=num_topk_groups, dim=-1, sorted=False).indices
     masked_scores = create_grouped_scores(scores, group_idx, num_nodes)
+    # 把没选的组的分数都设置为0，然后在这个里面选 topk
     topk_idx = torch.topk(masked_scores, num_topk, dim=-1, largest=True, sorted=False)[1]
+    # topk_weights ，rank 上的 weight 是 rank
     topk_weights = torch.ones((num_tokens, num_topk), dtype=torch.float32, device='cuda') * rank
+    # 构造最终选出来的 topk 的权重
     topk_weights_pure_rand = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda')
+    # rank_idx 指示每个 token 选出来的专家，落在 ep_rank 的 上，shape 是 [N, topk]
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
+    # 每个 token 去重之后的 ep_rank
     inplace_unique(rank_idx, num_ranks)
+    # rdma_rank_idx 指示每个 token 选的专家落到每个 node 的 idx
     rdma_rank_idx = rank_idx // num_local_ranks
     rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
     inplace_unique(rdma_rank_idx, num_nodes)
 
     # RDMA dispatch counts
+    # 指示每个 token 选出的专家，在哪个 node 上
     rdma_idx = topk_idx // (num_experts // num_nodes)
     rdma_idx.masked_fill_(topk_idx == -1, -1)
+    # 过滤出每个 rank 上的 token 要发送到的去重之后的专家
     inplace_unique(rdma_idx, num_nodes)
+    # 每个 rank 上的 token 要发送到的去重之后的 node 的数量
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
 
     # Expert meta
     num_tokens_per_expert = torch.zeros((num_experts, ), dtype=torch.int, device='cuda')
     for i in range(num_experts):
         num_tokens_per_expert[i] = (topk_idx == i).sum()
+    # 每一行 idx 指示当前这个专家 idx 有多少 token 路由过来
     gbl_num_tokens_per_expert = num_tokens_per_expert.clone()
+    # 在 EP 中通信，这样就是每个专家总共有多少 token 被路由过来
     dist.all_reduce(gbl_num_tokens_per_expert, group=group)
 
     # Rank layout meta
+    #[num_ranks]
     num_tokens_per_rank = torch.empty((num_ranks, ), dtype=torch.int, device='cuda')
+    # [num_nodes]
     num_tokens_per_rdma_rank = torch.empty((num_nodes, ), dtype=torch.int, device='cuda')
+    # [num_ranks, num_tokens] 这相当于是一个最大的 buffer，会有很多空余
     token_idx_in_rank = torch.full((num_ranks, num_tokens), -1, dtype=torch.long, device='cuda')
+
     for i in range(num_ranks):
+        # 当前 rank 有多少个 token 过来
         num_tokens_per_rank[i] = (rank_idx == i).sum()
+        # 表示 tokens 是否要发送到该 ep_rank，是一个 二进制指示向量
         token_sel = (rank_idx == i).max(dim=-1)[0]
+        # 表示发送到当前的 ep_rank 的 token 总数
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
+        # 摘出来token index，，根据 token index 从小到大排一下
         tokens[:count] = torch.sort(tokens[:count])[0]
+        # 发送到当前 ep_rank 上的 token 的 index 这个位置，放的是它是发到这个 ep_rank 上的第几个 token，或者说，
+        # 它前面有几个 token 也发到这个 ep_rank 上
         token_idx_in_rank[i][tokens[:count]] = torch.arange(count, dtype=torch.long, device='cuda')
+
     for i in range(num_nodes):
+        # 每个 node 上的 token 总数，或者说 rdma_rank 上的 token 总数，rdma_rank 等效于 node
         num_tokens_per_rdma_rank[i] = (rdma_rank_idx == i).sum()
+
+    # [num_ranks, num_tokens] 里面填的是 每个 rank 上是否有某个 token，有 token 的话，
+    # 填的是这个 token 是发到这个 rank 上的 idx 信息
+    # T [num_ranks, num_tokens] -> [num_tokens, num_ranks] 看成是，这个 token 是否在某个 rank 上
     token_idx_in_rank = token_idx_in_rank.T.contiguous().to(torch.int)
-    is_token_in_rank = token_idx_in_rank >= 0
+    # 改成一个指示矩阵，[num_tokens, num_ranks]，在的是 1 不在的是 0
+    # 指示全局来看，每个 ep_rank 上，有多少个 token 过来
     gbl_num_tokens_per_rank = num_tokens_per_rank.clone()
     dist.all_reduce(gbl_num_tokens_per_rank, group=group)
 
     ref_num_tokens_per_rank, ref_num_tokens_per_rdma_rank, ref_num_tokens_per_expert, ref_is_token_in_rank, _ = \
         buffer.get_dispatch_layout(topk_idx, num_experts)
     assert torch.allclose(ref_num_tokens_per_rank, num_tokens_per_rank)
+    # 这里有些疑问
     assert torch.allclose(ref_num_tokens_per_rdma_rank, num_tokens_per_rdma_rank)
     assert torch.allclose(ref_num_tokens_per_expert, num_tokens_per_expert)
     assert torch.allclose(ref_is_token_in_rank, is_token_in_rank)
