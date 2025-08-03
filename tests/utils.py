@@ -61,24 +61,51 @@ def per_token_cast_back(x_fp8: torch.Tensor, x_scales: torch.Tensor):
 
 
 def inplace_unique(x: torch.Tensor, num_slots: int):
+    # 确保输入是二维张量 [batch, topk]
     assert x.dim() == 2
+    
+    # 标记所有 padding 位置（值为 -1）
     mask = x < 0
+    
+    # 把 -1 映射到 num_slots（桶外索引），方便后续 scatter_add
     x_padded = x.masked_fill(mask, num_slots)
+    
+    # 创建计数器 [batch, num_slots+1]，初始全 0
     bin_count = torch.zeros((x.size(0), num_slots + 1), dtype=x.dtype, device=x.device)
+    
+    # 统计每个 rank 出现次数（scatter_add 会把相同索引的值累加）
     bin_count.scatter_add_(1, x_padded, torch.ones_like(x_padded))
+    
+    # 去掉桶外计数，只保留有效 rank 的统计
     bin_count = bin_count[:, :num_slots]
+    
+    # 按出现次数降序排序，得到排序后的次数和对应 rank
     sorted_bin_count, sorted_bin_idx = torch.sort(bin_count, dim=-1, descending=True)
+    
+    # 把未出现的 rank 标记为 -1
     sorted_bin_idx.masked_fill_(sorted_bin_count == 0, -1)
+    
+    # 再次排序，把 -1 全部沉到尾部
     sorted_bin_idx = torch.sort(sorted_bin_idx, descending=True, dim=-1).values
+    
+    # 清空原张量，全部置 -1
     x[:, :].fill_(-1)
+    
+    # 计算实际要保留的有效长度
     valid_len = min(num_slots, x.size(1))
+    
+    # 把处理后的结果写回原张量
     x[:, :valid_len] = sorted_bin_idx[:, :valid_len]
 
 
 def create_grouped_scores(scores: torch.Tensor, group_idx: torch.Tensor, num_groups: int):
+    # [n, e]
     num_tokens, num_experts = scores.shape
+    # [n, g, e]
     scores = scores.view(num_tokens, num_groups, -1)
+    # [n, g]
     mask = torch.zeros((num_tokens, num_groups), dtype=torch.bool, device=scores.device)
+    # 把对组的掩码，编程对所有 expert 的掩码，即 [n, e]
     mask = mask.scatter_(1, group_idx, True).unsqueeze(-1).expand_as(scores)
     return (scores * mask).view(num_tokens, num_experts)
 
