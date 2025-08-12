@@ -53,6 +53,16 @@ class Buffer:
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
                 Note: Releasing resources in the destructor may cause Python's exception handling process to hang.
+
+            group: 通信组
+            num_nvl_bytes: 节点内 NVLink 通信缓冲区大小
+            num_rdma_bytes: 节点间（或低延迟模式）RDMA 通信缓冲区大小
+            low_latency_mode: 是否启用低延迟模式
+            num_qps_per_rank: 每 rank 的 RDMA QP 数，低延迟模式下需等于本地专家数
+            allow_nvlink_for_low_latency_mode: 低延迟模式是否允许走 NVLink；与 hook 重叠不兼容，PCIe 连接可能出错
+            allow_mnnvl: 是否允许多节点 NVLink
+            explicitly_destroy: True 时需手动调用 destroy() 释放资源，否则析构函数自动释放（可能阻塞异常处理）
+
         """
         check_nvlink_connections(group)
 
@@ -337,7 +347,46 @@ class Buffer:
                 will be empty.
             handle: the returned communication handle.
             event: the event after executing the kernel (valid only if `async_finish` is set).
+
+
+
+        将 token 分发到不同的 rank，同时支持节点内和节点间配置。
+        节点内 kernel 要求所有 rank 通过 NVLink 可见。
+        节点间 kernel 要求节点内的 rank 通过 NVLink 可见，而具有相同 GPU 索引的 rank 则通过 RDMA 可见。
+
+        参数：
+            x: `torch.Tensor` 或 `torch.Tensor` 的元组。第一种类型形状为 `[num_tokens, hidden]`，
+                类型必须是 `torch.bfloat16`；第二种类型元组的第一个元素形状为 `[num_tokens, hidden]`，
+                类型为 `torch.float8_e4m3fn`，第二个元素形状为 `[num_tokens, hidden // 128]`
+                （要求可被 128 整除）且类型为 `torch.float`。
+            handle: 可选的通信句柄；若提供，CPU 会复用布局信息以节省时间。
+            num_tokens_per_rank: `[num_ranks]`，类型为 `torch.int`，要发送到每个 rank 的 token 数量。
+            num_tokens_per_rdma_rank: `[num_rdma_ranks]`，类型为 `torch.int`，要发送到每个 RDMA rank
+                （具有相同 GPU 索引）的 token 数量；节点内配置时返回 `None`。
+            is_token_in_rank: `[num_tokens, num_ranks]`，类型为 `torch.bool`，表示某个 token 是否要发送到某个 rank。
+            num_tokens_per_expert: `[num_experts]`，类型为 `torch.int`，要发送到每个 expert 的 token 数量。
+            topk_idx: `[num_tokens, num_topk]`，类型为 `torch.int64`，每个 token 选择的 expert 索引，
+                `-1` 表示未选择。
+            topk_weights: `[num_tokens, num_topk]`，类型为 `torch.float`，每个 token 分发时对应的 expert 权重。
+            expert_alignment: 将每个本地 expert 接收到的 token 数量对齐到该变量。
+            num_worst_tokens: 最坏情况下接收的 token 数量；若指定，将不会进行 CPU 同步，
+                且兼容 CUDA graph。请注意该标志仅用于节点内配置。
+            config: 性能调优配置。
+            previous_event: 在实际执行 kernel 前需要等待的事件。
+            async_finish: 若设置，当前流不会等待通信 kernel 完成。
+            allocate_on_comm_stream: 控制所有已分配张量的所有权是否归属于通信流。
+
+        返回：
+            recv_x: 接收到的 token，类型及元组结构与输入 `x` 相同，但 token 数量等于实际接收的 token 数。
+            recv_topk_idx: 接收到的 expert 索引。
+            recv_topk_weights: 接收到的 expert 权重。
+            num_recv_tokens_per_expert_list: Python 列表，形状为 `[num_local_experts]`，每个本地 expert 接收到的 token 数量，
+                已对齐到输入的 `expert_alignment`。若指定了 `num_worst_tokens`，该列表将为空。
+            handle: 返回的通信句柄。
+            event: 执行 kernel 后的事件（仅当设置了 `async_finish` 时有效）。
         """
+
+
         # Default config
         config = self.get_dispatch_config(self.group_size) if config is None else config
 

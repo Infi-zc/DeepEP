@@ -36,6 +36,7 @@ struct Config {
         EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens > 0 and num_max_rdma_chunked_recv_tokens > 0);
 
         // Ceil up RDMA buffer size
+        // 接收区是发送区的整数倍
         this->num_max_rdma_chunked_recv_tokens = align<int>(num_max_rdma_chunked_recv_tokens, num_max_rdma_chunked_send_tokens);
         EP_HOST_ASSERT(num_max_rdma_chunked_send_tokens < num_max_rdma_chunked_recv_tokens);
         // NOTES: this assertion is related to RDMA lazy head update, we must ensure senders always have space to push

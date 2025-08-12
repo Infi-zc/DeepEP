@@ -47,18 +47,19 @@ def test_main(args: argparse.Namespace, num_sms: int,
     # rank_idx 指示每个 token 选出来的专家，都落在第几个 ep_rank 上 ，shape 是 [N, topk]
     rank_idx = topk_idx // (num_experts // num_ranks)
     rank_idx.masked_fill_(topk_idx == -1, -1)
-    # 每个 token 去重之后的 ep_rank
+    # rank_idx: 每个 token 去重之后，去到 ep_rank 降序排序后的 rank index，出来之后 shape 是 [N, num_ranks]
     inplace_unique(rank_idx, num_ranks)
-    # rdma_rank_idx 指示每个 token 选的专家落到每个 node 的 idx
+    # rdma_rank_idx 指示每个 token 选的专家, 通过同号卡发送的方式，落到每个 node 的 idx
     rdma_rank_idx = rank_idx // num_local_ranks
     rdma_rank_idx.masked_fill_(rank_idx == -1, -1)
+    # rdma_rank_idx: 每个 token 去重后，去到 node_rank 降序排序后的 node index, 出来之后 shape 是 [N, num_nodes]
     inplace_unique(rdma_rank_idx, num_nodes)
 
     # RDMA dispatch counts
     # 指示每个 token 选出的专家，在哪个 node 上
     rdma_idx = topk_idx // (num_experts // num_nodes)
     rdma_idx.masked_fill_(topk_idx == -1, -1)
-    # 过滤出每个 rank 上的 token 要发送到的去重之后的专家
+    # 过滤出每个 rank 上的 token 要发送到的去重之后的专家, 出来之后 shape 是 [N, num_nodes]
     inplace_unique(rdma_idx, num_nodes)
     # 每个 rank 上的 token 要发送到的去重之后的 node 的数量
     num_rdma_token_sent = rdma_idx.ne(-1).sum().item()
@@ -85,7 +86,7 @@ def test_main(args: argparse.Namespace, num_sms: int,
         num_tokens_per_rank[i] = (rank_idx == i).sum()
         # 表示 tokens 是否要发送到该 ep_rank，是一个 二进制指示向量
         token_sel = (rank_idx == i).max(dim=-1)[0]
-        # 表示发送到当前的 ep_rank 的 token 总数
+        # 表示本地这些token发送到当前的 ep_rank 的 token 总数
         count = token_sel.sum().item()
         tokens = torch.sort(token_sel.to(torch.int), descending=True)[1]
         # 摘出来token index，，根据 token index 从小到大排一下
@@ -123,7 +124,9 @@ def test_main(args: argparse.Namespace, num_sms: int,
     time.sleep(1)
 
     # Config
-    rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
+    # rdma_buffer_size = 128
+    # nvl_buffer_size = (720 if num_ranks in (144, 160) else 512)
+    rdma_buffer_size= nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
