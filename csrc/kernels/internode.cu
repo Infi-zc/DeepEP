@@ -379,10 +379,16 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
+    // channel 是 sm 数量的一半，每 2 个 sm 对应 1 个 channel
     const auto num_channels = num_sms / 2, channel_id = sm_id / 2;
+    // 偶数 idx 是转发者
     const bool is_forwarder = sm_id % 2 == 0;
+    //
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
 
+    // num_rc_per_pe
+    // pe 是 processing element 的缩写，指代当前独立可执行的进程/线程
+    // rc 是 reliable connect 的缩写
     EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe == num_channels or ibgda_get_state()->num_rc_per_pe >= num_sms);
 
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
